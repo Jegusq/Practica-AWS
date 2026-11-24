@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Datos y artefactos locales (los PDFs viven en S3, no en el repo)
+data/
+*.zip
+
+# Credenciales: nunca al repositorio
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+.aws/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+terraform.tfvars
+*.auto.tfvars
+# El lock file SI se versiona (reproducibilidad de providers)
+!.terraform.lock.hcl
+
+# IDE / SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,81 @@
+name: Pipeline de datos
+
+# Ejecuta el pipeline por lotes en GitHub Actions: captura (scraping) -> S3, extraccion con Bedrock y carga en
+# Aurora. Es manual a proposito: llama a Bedrock (coste por token) y descarga PDFs de webs de terceros.
+# Tambien se puede ejecutar en local con `python -m kid all` (ver README).
+on:
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: "Fuentes separadas por espacio (bestinver azvalor cobas)"
+        default: "cobas azvalor bestinver"
+      limit:
+        description: "Maximo de KID por fuente (vacio = todos)"
+        default: ""
+      model:
+        description: "Modelo de Bedrock (perfil de inferencia)"
+        default: "eu.anthropic.claude-haiku-5-5"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      KID_CONTACT: ${{ vars.KID_CONTACT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "<2.0.0"
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install --quiet -e .
+
+      - name: Leer las salidas de Terraform (bucket y base de datos)
+        working-directory: infra/main
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=kid/main.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+          {
+            echo "KID_BUCKET=$(terraform output -raw bucket)"
+            echo "DB_CLUSTER_ARN=$(terraform output -raw db_cluster_arn)"
+            echo "DB_SECRET_ARN=$(terraform output -raw db_secret_arn)"
+            echo "DB_NAME=$(terraform output -raw db_name)"
+          } >> "$GITHUB_ENV"
+
+      - name: scrape + extract + migrate + load
+        # Los inputs se pasan por entorno (no interpolados en el script) para evitar inyeccion de comandos.
+        env:
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_SOURCES: ${{ inputs.sources }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+        run: |
+          read -r -a SOURCES <<< "$INPUT_SOURCES"
+          ARGS=(--model "$INPUT_MODEL" --sources "${SOURCES[@]}")
+          if [ -n "$INPUT_LIMIT" ]; then ARGS+=(--limit "$INPUT_LIMIT"); fi
+          python -m kid all "${ARGS[@]}"

@@ -1,0 +1,127 @@
+name: Deploy
+
+# Despliega la infraestructura (Terraform) y la aplicacion en AWS.
+# Autenticacion por OIDC: no hay claves de acceso de AWS en GitHub, solo estas VARIABLES del repositorio:
+#   AWS_REGION, AWS_ROLE_ARN, TF_STATE_BUCKET        (las da `terraform output` de infra/bootstrap)
+#   DEPLOY_WEB_APP     (opcional: "false" para no desplegar la web en los push a main)
+#   BUDGET_ALERT_EMAIL (opcional: correo para la alerta de presupuesto de AWS Budgets)
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/main/**"
+      - "src/**"
+      - "app/**"
+      - "requirements/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "apply = desplegar / destroy = borrar TODO lo creado por este stack"
+        type: choice
+        options: [apply, destroy]
+        default: apply
+      deploy_web_app:
+        description: "Desplegar la web (ALB + Fargate: ~1,4 USD/dia)"
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write # necesario para OIDC
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+  TF_VAR_budget_alert_email: ${{ vars.BUDGET_ALERT_EMAIL }}
+  # string 'false'/'true' (en expresiones `a && false || b` devolveria b)
+  TF_VAR_deploy_web_app: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.deploy_web_app) || vars.DEPLOY_WEB_APP || 'true' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "<2.0.0"
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Empaquetar la Lambda de la API
+        run: bash scripts/build_lambda.sh
+
+      - name: Terraform init
+        working-directory: infra/main
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=kid/main.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      # ---- borrar todo -------------------------------------------------------------------------------
+      - name: Terraform destroy
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+        working-directory: infra/main
+        run: terraform destroy -auto-approve -input=false
+
+      # ---- desplegar ---------------------------------------------------------------------------------
+      - name: 1/4 Crear el repositorio ECR (la imagen debe existir antes que el servicio)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.action == 'destroy') && env.TF_VAR_deploy_web_app == 'true' }}
+        working-directory: infra/main
+        run: terraform apply -auto-approve -input=false -target=aws_ecr_repository.app
+
+      - name: 2/4 Construir y subir la imagen de la app
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.action == 'destroy') && env.TF_VAR_deploy_web_app == 'true' }}
+        run: |
+          REPO=$(terraform -chdir=infra/main output -raw ecr_repository_url)
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${REPO%%/*}"
+          docker build -t "$REPO:${GITHUB_SHA::12}" app
+          docker push "$REPO:${GITHUB_SHA::12}"
+
+      - name: 3/4 Terraform apply
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.action == 'destroy') }}
+        working-directory: infra/main
+        run: |
+          TAG=""
+          if [ "$TF_VAR_deploy_web_app" = "true" ]; then TAG="${GITHUB_SHA::12}"; fi
+          terraform apply -auto-approve -input=false -var "app_image_tag=$TAG"
+
+      - name: 4/4 Aplicar el esquema de la base de datos
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.action == 'destroy') }}
+        run: |
+          pip install --quiet -e .
+          export DB_CLUSTER_ARN=$(terraform -chdir=infra/main output -raw db_cluster_arn)
+          export DB_SECRET_ARN=$(terraform -chdir=infra/main output -raw db_secret_arn)
+          export DB_NAME=$(terraform -chdir=infra/main output -raw db_name)
+          python -m kid migrate
+
+      - name: Resumen
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.action == 'destroy') }}
+        run: |
+          {
+            echo "### Despliegue completado"
+            echo "- **API:** $(terraform -chdir=infra/main output -raw api_url)  (docs en \`/docs\`)"
+            echo "- **Web:** $(terraform -chdir=infra/main output -raw web_url 2>/dev/null || echo 'no desplegada')"
+            echo "- **Bucket:** $(terraform -chdir=infra/main output -raw bucket)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,4 @@
+# Dependencias de la Lambda de la API (boto3 lo aporta el runtime de Lambda).
+fastapi>=0.115,<1
+mangum>=0.19,<1
+pydantic>=2.8,<3
